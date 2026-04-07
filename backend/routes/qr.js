@@ -15,87 +15,80 @@ function signPayload(payload) {
   return crypto.createHmac('sha256', process.env.JWT_SECRET || 'secret').update(str).digest('hex');
 }
 
-// POST /api/qr/generate
+// --- FIX: The "Active" Route ---
+// This must be JUST '/active/:subjectId' because server.js adds '/api/qr'
+router.get('/active/:subjectId', protect, requireRole('teacher'), async (req, res) => {
+  try {
+    const session = await QRSession.findOne({
+      subject: req.params.subjectId,
+      teacher: req.user._id,
+      isActive: true,
+      expiresAt: { $gt: new Date() }
+    }).lean();
+
+    // Crucial: Return null if no session exists, don't throw 404
+    res.json({ 
+      success: true, 
+      session: session || null 
+    });
+  } catch (err) {
+    console.error("Active Session Error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- FIX: The "Generate" Route ---
 router.post('/generate', protect, requireRole('teacher'), async (req, res) => {
   try {
     const { subjectId, duration = 15, latitude, longitude } = req.body;
 
-    if (!subjectId) return res.status(400).json({ error: 'Subject ID is required.' });
-
     const subject = await Subject.findOne({ _id: subjectId, teacher: req.user._id });
-    if (!subject) return res.status(404).json({ error: 'Subject not found or unauthorized.' });
+    if (!subject) return res.status(404).json({ error: 'Subject not found.' });
 
-    // 1. Determine Location (Live vs Database fallback)
     const sessionLat = latitude || subject.classroom.latitude;
     const sessionLng = longitude || subject.classroom.longitude;
 
-    // Expire any previous active sessions for this subject
-    await QRSession.updateMany(
-      { subject: subjectId, isActive: true },
-      { isActive: false }
-    );
+    // Expire old ones
+    await QRSession.updateMany({ subject: subjectId, isActive: true }, { isActive: false });
 
     const sessionId = uuidv4();
     const expiresAt = new Date(Date.now() + duration * 60 * 1000);
 
-    // 2. Create the Payload
     const payload = {
       sessionId,
       subjectId: subject._id.toString(),
       teacherId: req.user._id.toString(),
-      subjectCode: subject.code,
       classroomLat: sessionLat,
       classroomLng: sessionLng,
-      classroomRadius: subject.classroom.radius || 100,
-      expiresAt: expiresAt.toISOString(),
-      issuedAt: new Date().toISOString()
+      expiresAt: expiresAt.toISOString()
     };
 
-    // 3. Generate Signature and the REQUIRED qrCodeData string
     const signature = signPayload(payload);
-    const qrCodeData = JSON.stringify({ ...payload, sig: signature }); 
+    const qrCodeData = JSON.stringify({ ...payload, sig: signature });
 
-    // 4. Generate QR image
     const attendanceUrl = `${CLIENT_URL}/scan?session=${encodeURIComponent(sessionId)}`;
-    const qrCodeImage = await QRCode.toDataURL(attendanceUrl, {
-      width: 512,
-      margin: 2,
-      color: { dark: '#1e1b4b', light: '#ffffff' },
-      errorCorrectionLevel: 'H'
-    });
+    const qrCodeImage = await QRCode.toDataURL(attendanceUrl);
 
-    // 5. Create the Session using the exact schema fields
     const session = await QRSession.create({
       sessionId,
-      subject: subject._id,
+      subject: subjectId,
       teacher: req.user._id,
-      qrCodeData,       // Matches your required schema field
-      qrCodeImage,      // Matches your schema
-      expiresAt,        // Matches your schema
+      qrCodeData,
+      qrCodeImage,
+      expiresAt,
       isActive: true,
       classroom: {
         latitude: sessionLat,
         longitude: sessionLng,
         radius: subject.classroom.radius || 100
       },
-      payload,          // Stores the object as per your schema
-      classDate: new Date()
+      payload
     });
 
-    // Increment totalClasses for subject
     await Subject.findByIdAndUpdate(subjectId, { $inc: { totalClasses: 1 } });
 
-    res.json({
-      success: true,
-      session: {
-        sessionId: session.sessionId,
-        qrCodeImage: session.qrCodeImage,
-        expiresAt: session.expiresAt,
-        subject: { name: subject.name, code: subject.code }
-      }
-    });
+    res.json({ success: true, session });
   } catch (err) {
-    console.error("QR Error:", err);
     res.status(500).json({ error: err.message });
   }
 });
