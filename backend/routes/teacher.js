@@ -1,45 +1,41 @@
 const express = require('express');
 const router = express.Router();
 const { protect, requireRole } = require('../middleware/auth');
-const Subject = require('../models/Subject');
-const Attendance = require('../models/Attendance');
-const QRSession = require('../models/QRSession');
-const User = require('../models/User');
+const supabase = require('../config/supabase');
 const { Parser } = require('json2csv');
 
-// GET /api/teacher/dashboard
 router.get('/dashboard', protect, requireRole('teacher'), async (req, res) => {
   try {
-    const teacherId = req.user._id;
+    const teacherId = req.user.id;
 
-    const subjects = await Subject.find({ teacher: teacherId })
-      .populate('students', 'name email rollNumber')
-      .lean();
+    const { data: subjects } = await supabase
+      .from('subjects')
+      .select('*, subject_students(student_id)')
+      .eq('teacher_id', teacherId);
 
-    const subjectStats = await Promise.all(subjects.map(async (subject) => {
-      const totalClasses = subject.totalClasses || 0;
-      const totalStudents = subject.students?.length || 0;
+    const subjectStats = await Promise.all((subjects || []).map(async (subject) => {
+      const totalClasses = subject.total_classes || 0;
+      const totalStudents = subject.subject_students?.length || 0;
 
-      // Overall attendance rate for subject
-      const totalAttendanceRecords = await Attendance.countDocuments({
-        subject: subject._id,
-        status: 'present'
-      });
+      const { count: presentCount } = await supabase
+        .from('attendance')
+        .select('*', { count: 'exact', head: true })
+        .eq('subject_id', subject.id)
+        .eq('status', 'present');
 
-      const maxPossibleAttendances = totalClasses * totalStudents;
-      const overallRate = maxPossibleAttendances > 0
-        ? Math.round((totalAttendanceRecords / maxPossibleAttendances) * 100)
-        : 0;
+      const maxPossible = totalClasses * totalStudents;
+      const overallRate = maxPossible > 0 ? Math.round(((presentCount || 0) / maxPossible) * 100) : 0;
 
-      // Recent sessions
-      const recentSessions = await QRSession.find({ subject: subject._id })
-        .sort({ classDate: -1 })
-        .limit(3)
-        .lean();
+      const { data: recentSessions } = await supabase
+        .from('qr_sessions')
+        .select('class_date, attendance_count')
+        .eq('subject_id', subject.id)
+        .order('class_date', { ascending: false })
+        .limit(3);
 
       return {
         subject: {
-          _id: subject._id,
+          _id: subject.id,
           name: subject.name,
           code: subject.code,
           color: subject.color,
@@ -48,12 +44,16 @@ router.get('/dashboard', protect, requireRole('teacher'), async (req, res) => {
         totalClasses,
         totalStudents,
         overallRate,
-        recentSessions: recentSessions.map(s => ({
-          date: s.classDate,
-          attendanceCount: s.attendanceCount
+        recentSessions: (recentSessions || []).map(s => ({
+          date: s.class_date,
+          attendanceCount: s.attendance_count
         }))
       };
     }));
+
+    const uniqueStudentIds = new Set(
+      (subjects || []).flatMap(s => (s.subject_students || []).map(ss => ss.student_id))
+    );
 
     res.json({
       success: true,
@@ -63,8 +63,8 @@ router.get('/dashboard', protect, requireRole('teacher'), async (req, res) => {
         department: req.user.department
       },
       summary: {
-        totalSubjects: subjects.length,
-        totalStudents: [...new Set(subjects.flatMap(s => s.students?.map(st => st._id?.toString()) || []))].length
+        totalSubjects: (subjects || []).length,
+        totalStudents: uniqueStudentIds.size
       },
       subjects: subjectStats
     });
@@ -73,32 +73,40 @@ router.get('/dashboard', protect, requireRole('teacher'), async (req, res) => {
   }
 });
 
-// GET /api/teacher/subject/:subjectId
 router.get('/subject/:subjectId', protect, requireRole('teacher'), async (req, res) => {
   try {
-    const subject = await Subject.findOne({
-      _id: req.params.subjectId,
-      teacher: req.user._id
-    }).populate('students', 'name email rollNumber semester').lean();
+    const { data: subject } = await supabase
+      .from('subjects')
+      .select(`
+        *,
+        subject_students (
+          users (id, name, email, roll_number, semester)
+        )
+      `)
+      .eq('id', req.params.subjectId)
+      .eq('teacher_id', req.user.id)
+      .single();
 
     if (!subject) return res.status(404).json({ error: 'Subject not found.' });
 
-    const totalClasses = subject.totalClasses || 0;
+    const students = (subject.subject_students || []).map(ss => ss.users).filter(Boolean);
+    const totalClasses = subject.total_classes || 0;
 
-    // Per student attendance
-    const studentStats = await Promise.all((subject.students || []).map(async (student) => {
-      const attended = await Attendance.countDocuments({
-        subject: subject._id,
-        student: student._id,
-        status: 'present'
-      });
+    const studentStats = await Promise.all(students.map(async (student) => {
+      const { count: attendedCount } = await supabase
+        .from('attendance')
+        .select('*', { count: 'exact', head: true })
+        .eq('subject_id', subject.id)
+        .eq('student_id', student.id)
+        .eq('status', 'present');
 
+      const attended = attendedCount || 0;
       return {
         student: {
-          _id: student._id,
+          _id: student.id,
           name: student.name,
           email: student.email,
-          rollNumber: student.rollNumber
+          rollNumber: student.roll_number
         },
         attended,
         absent: totalClasses - attended,
@@ -107,61 +115,64 @@ router.get('/subject/:subjectId', protect, requireRole('teacher'), async (req, r
       };
     }));
 
-    // Session history
-    const sessions = await QRSession.find({ subject: subject._id })
-      .sort({ classDate: -1 })
-      .lean();
+    const { data: sessions } = await supabase
+      .from('qr_sessions')
+      .select('*')
+      .eq('subject_id', subject.id)
+      .order('class_date', { ascending: false });
 
-    const sessionDetails = await Promise.all(sessions.map(async (session) => {
-      const presentStudents = await Attendance.find({
-        session: session._id,
-        status: 'present'
-      }).populate('student', 'name rollNumber').lean();
+    const sessionDetails = await Promise.all((sessions || []).map(async (session) => {
+      const { data: present } = await supabase
+        .from('attendance')
+        .select('users!attendance_student_id_fkey(name, roll_number)')
+        .eq('session_uuid', session.id)
+        .eq('status', 'present');
 
       return {
-        _id: session._id,
-        date: session.classDate,
-        attendanceCount: session.attendanceCount,
-        presentStudents: presentStudents.map(a => ({
-          name: a.student?.name,
-          rollNumber: a.student?.rollNumber
+        _id: session.id,
+        date: session.class_date,
+        attendanceCount: session.attendance_count,
+        presentStudents: (present || []).map(a => ({
+          name: a.users?.name,
+          rollNumber: a.users?.roll_number
         }))
       };
     }));
 
-    // Monthly attendance trend
+    // Monthly trend (last 6 months)
     const sixMonthsAgo = new Date();
     sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
 
-    const monthlyTrend = await Attendance.aggregate([
-      {
-        $match: {
-          subject: subject._id,
-          date: { $gte: sixMonthsAgo },
-          status: 'present'
-        }
-      },
-      {
-        $group: {
-          _id: {
-            year: { $year: '$date' },
-            month: { $month: '$date' }
-          },
-          count: { $sum: 1 }
-        }
-      },
-      { $sort: { '_id.year': 1, '_id.month': 1 } }
-    ]);
+    const { data: trendRecords } = await supabase
+      .from('attendance')
+      .select('date')
+      .eq('subject_id', subject.id)
+      .eq('status', 'present')
+      .gte('date', sixMonthsAgo.toISOString());
+
+    const trendMap = {};
+    (trendRecords || []).forEach(r => {
+      const d = new Date(r.date);
+      const key = `${d.getUTCFullYear()}-${d.getUTCMonth() + 1}`;
+      if (!trendMap[key]) {
+        trendMap[key] = { _id: { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1 }, count: 0 };
+      }
+      trendMap[key].count++;
+    });
+
+    const monthlyTrend = Object.values(trendMap).sort(
+      (a, b) => a._id.year - b._id.year || a._id.month - b._id.month
+    );
 
     res.json({
       success: true,
       subject: {
-        _id: subject._id,
+        _id: subject.id,
         name: subject.name,
         code: subject.code,
         color: subject.color,
         totalClasses,
-        totalStudents: subject.students?.length || 0,
+        totalStudents: students.length,
         schedule: subject.schedule
       },
       studentStats: studentStats.sort((a, b) => a.student.name?.localeCompare(b.student.name)),
@@ -173,30 +184,38 @@ router.get('/subject/:subjectId', protect, requireRole('teacher'), async (req, r
   }
 });
 
-// GET /api/teacher/subject/:subjectId/download-csv
 router.get('/subject/:subjectId/download-csv', protect, requireRole('teacher'), async (req, res) => {
   try {
-    const subject = await Subject.findOne({
-      _id: req.params.subjectId,
-      teacher: req.user._id
-    }).populate('students', 'name email rollNumber').lean();
+    const { data: subject } = await supabase
+      .from('subjects')
+      .select(`
+        *,
+        subject_students (
+          users (id, name, email, roll_number)
+        )
+      `)
+      .eq('id', req.params.subjectId)
+      .eq('teacher_id', req.user.id)
+      .single();
 
     if (!subject) return res.status(404).json({ error: 'Subject not found.' });
 
-    const sessions = await QRSession.find({ subject: subject._id }).sort({ classDate: 1 }).lean();
-    const totalClasses = subject.totalClasses || 0;
+    const students = (subject.subject_students || []).map(ss => ss.users).filter(Boolean);
+    const totalClasses = subject.total_classes || 0;
 
-    const rows = await Promise.all((subject.students || []).map(async (student) => {
-      const attended = await Attendance.countDocuments({
-        subject: subject._id,
-        student: student._id,
-        status: 'present'
-      });
+    const rows = await Promise.all(students.map(async (student) => {
+      const { count: attendedCount } = await supabase
+        .from('attendance')
+        .select('*', { count: 'exact', head: true })
+        .eq('subject_id', subject.id)
+        .eq('student_id', student.id)
+        .eq('status', 'present');
 
+      const attended = attendedCount || 0;
       const percentage = totalClasses > 0 ? ((attended / totalClasses) * 100).toFixed(1) : '0.0';
 
       return {
-        'Roll Number': student.rollNumber || 'N/A',
+        'Roll Number': student.roll_number || 'N/A',
         'Student Name': student.name,
         'Email': student.email,
         'Total Classes': totalClasses,
